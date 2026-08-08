@@ -1,0 +1,9 @@
+ferret_mail_service.py - 脱敏后的完整单文件程序，包含 SMTP、HTTP、SQLite、后台 UI 和动态文档
+test_ferret_mail_service.py - 标准库回归测试，覆盖收件、权限、并发、备份恢复、HTTP 和 SMTP 故障语义
+.env.example - 完整环境变量模板，不含真实地址或密钥
+技术文档.md - 面向 AI/开发者的架构、数据、接口、安全、UI 和验证说明
+部署教程.md - 面向 AI/运维的 Linux、systemd、Cloudflare、更新、备份和验收步骤
+人类使用说明.txt - 面向普通使用者的后台、收件、别名、域名和排障说明
+
+不包含：真实 Token、SSH 凭据、生产域名、生产 IP、SQLite 数据库、附件、备份、日志和缓存。
+文档状态：2026-08-07 已核对。
