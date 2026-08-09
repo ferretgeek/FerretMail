@@ -21,6 +21,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from email import policy
+from email.utils import parseaddr
 from email.parser import BytesParser
 from email.header import decode_header, make_header
 from html.parser import HTMLParser
@@ -1054,13 +1055,17 @@ def init_db():
 init_db()
 private_file(DB_PATH)
 
-EMAIL_RE = re.compile(r"<?([^<>\s@]+@[^<>\s@]+)>?")
 ALIAS_SHARE_TOKEN_PREFIX = "alias_"
 ALIAS_SHARE_TOKEN_RE = re.compile(r"^alias_[A-Za-z0-9_-]{40,120}$")
 
 def normalize_addr(value):
-    m = EMAIL_RE.search(str(value or "").strip())
-    return (m.group(1) if m else "").lower().strip()
+    address = parseaddr(str(value or "").strip())[1].lower().strip()
+    if len(address) > 320 or address.count("@") != 1:
+        return ""
+    local, domain = address.rsplit("@", 1)
+    if not local or not domain or any(char.isspace() or char in "<>" for char in address):
+        return ""
+    return address
 
 
 def smtp_path(value, prefix, allow_empty=False):
