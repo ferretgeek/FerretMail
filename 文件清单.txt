@@ -4,6 +4,8 @@ test_ferret_mail_service.py - 标准库回归测试，覆盖收件、权限、�
 技术文档.md - 面向 AI/开发者的架构、数据、接口、安全、UI 和验证说明
 部署教程.md - 面向 AI/运维的 Linux、systemd、Cloudflare、更新、备份和验收步骤
 人类使用说明.txt - 面向普通使用者的后台、收件、别名、域名和排障说明
+CONTRIBUTING.md - 双语贡献与验证门禁
+CHANGELOG.md - 双语公开版本变更入口
 
 不包含：真实 Token、SSH 凭据、生产域名、生产 IP、SQLite 数据库、附件、备份、日志和缓存。
-文档状态：2026-08-07 已核对。
+文档状态：2026-08-10 已核对。

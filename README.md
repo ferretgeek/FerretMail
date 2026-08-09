@@ -68,7 +68,7 @@ Ferret Mail is a self-hosted, receive-only domain mail service. One Python file 
 
 Ferret Mail is designed for personal domains, test environments, code inboxes, and small internal tools. It is not an outbound mail server, IMAP service, calendar, or full mail client. Public deployment requires a reachable TCP 25 port, valid MX/A records, and HTTPS in front of the admin UI.
 
-See the [deployment guide](部署教程.md), [technical reference](技术文档.md), and [configuration template](.env.example).
+See the [deployment guide](部署教程.md), [technical reference](技术文档.md), [contributing guide](CONTRIBUTING.md), [changelog](CHANGELOG.md), and [configuration template](.env.example).
 
 ## Privacy & security
 
