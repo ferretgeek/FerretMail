@@ -2,7 +2,7 @@
   <img src="docs/images/social-preview.png" alt="Ferret Mail social preview" width="100%">
 </p>
 
-<h1 align="center">Ferret Mail</h1>
+<h1 align="center">Ferret Mail — 自托管域名收件箱 / Self-hosted Domain Inbox</h1>
 
 <p align="center">
   给自己的域名，留一间只负责接住消息的房间。<br>
