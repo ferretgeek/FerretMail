@@ -33,6 +33,7 @@ Ferret Mail 是一个可自托管的“只收不发”域名邮箱：它在一�
 
 - 接收多个主域名、子域名与自动别名的邮件；
 - 在网页里检索邮件、阅读正文、复制验证码、查看链接和下载附件；
+- 在全局使用天光、墨玉、素纸三套浅色主题或 `#17191d` 深灰模式，并记住选择；
 - 为不同域名签发独立管理 Token，也可创建单别名接码链接；
 - 提供长轮询 API、Webhook、DNS 检查、容量配额、限流与操作日志；
 - 自动备份 SQLite 数据，并对 HTTP、SMTP、磁盘和备份状态做健康检查。
@@ -60,6 +61,7 @@ Ferret Mail is a self-hosted, receive-only domain mail service. One Python file 
 
 - Receive mail for multiple root domains, subdomains, and automatically created aliases.
 - Search and read messages, copy codes, inspect links, and download attachments in the web UI.
+- Choose from Skyline, Moyu, and Minimal light palettes or the `#17191d` deep-gray mode; the preference persists globally.
 - Issue per-domain admin tokens or narrowly scoped public inbox links.
 - Use long-polling APIs, webhooks, DNS checks, quotas, rate limits, and operation logs.
 - Back up SQLite data and monitor HTTP, SMTP, storage, and backup health.
