@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
 from email.header import decode_header, make_header
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import BoundedSemaphore, Condition, Lock, RLock, Thread
@@ -1064,12 +1065,17 @@ def normalize_addr(value):
 
 def smtp_path(value, prefix, allow_empty=False):
     value = str(value or "").strip()
-    match = re.match(rf"^{re.escape(prefix)}\s*:\s*<([^<>]*)>(?:\s+.*)?$", value, re.I)
-    if not match:
-        match = re.match(rf"^{re.escape(prefix)}\s*:\s*([^\s<>]+)(?:\s+.*)?$", value, re.I)
-    if not match:
+    label, separator, remainder = value.partition(":")
+    if not separator or label.strip().lower() != str(prefix).strip().lower():
         raise ValueError(f"{prefix} path invalid")
-    raw = match.group(1).strip()
+    remainder = remainder.strip()
+    if remainder.startswith("<"):
+        close = remainder.find(">", 1)
+        if close < 0:
+            raise ValueError(f"{prefix} path invalid")
+        raw = remainder[1:close].strip()
+    else:
+        raw = remainder.split(None, 1)[0] if remainder else ""
     if not raw and allow_empty:
         return ""
     address = normalize_addr(raw)
@@ -1910,32 +1916,79 @@ def _message_from_raw(raw):
     return BytesParser(policy=policy.default).parsebytes((raw or "").encode("utf-8", errors="replace"))
 
 
+_MAIL_HTML_TAGS = {
+    "a", "b", "blockquote", "br", "code", "div", "em", "h1", "h2", "h3",
+    "h4", "h5", "h6", "hr", "i", "li", "ol", "p", "pre", "s", "span",
+    "strong", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul",
+}
+_MAIL_HTML_BLOCKED = {
+    "applet", "audio", "button", "canvas", "form", "frameset", "iframe", "math",
+    "object", "script", "select", "style", "svg", "template", "textarea", "video",
+}
+_MAIL_HTML_DROPPED = {"base", "embed", "frame", "img", "input", "link", "meta"}
+_MAIL_HTML_VOID = {"br", "hr"}
+
+
+class _MailHTMLSanitizer(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.output = []
+        self.blocked_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        tag = str(tag or "").lower()
+        if tag in _MAIL_HTML_DROPPED:
+            return
+        if tag in _MAIL_HTML_BLOCKED:
+            self.blocked_depth += 1
+            return
+        if self.blocked_depth or tag not in _MAIL_HTML_TAGS:
+            return
+        safe_attrs = []
+        for name, value in attrs:
+            name = str(name or "").lower()
+            value = str(value or "")
+            if name == "title" and len(value) <= 500:
+                safe_attrs.append((name, value))
+            elif tag == "a" and name == "href":
+                parsed = urlparse(value.strip())
+                if parsed.scheme.lower() in {"http", "https", "mailto"}:
+                    safe_attrs.append(("href", value.strip()))
+            elif tag in {"td", "th"} and name in {"colspan", "rowspan"} and value.isdigit() and 1 <= int(value) <= 100:
+                safe_attrs.append((name, value))
+        if tag == "a":
+            safe_attrs.extend((("rel", "noopener noreferrer"), ("target", "_blank")))
+        rendered = "".join(f' {name}="{html.escape(value, quote=True)}"' for name, value in safe_attrs)
+        self.output.append(f"<{tag}{rendered}>")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if str(tag or "").lower() not in _MAIL_HTML_VOID:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        tag = str(tag or "").lower()
+        if tag in _MAIL_HTML_DROPPED:
+            return
+        if tag in _MAIL_HTML_BLOCKED:
+            self.blocked_depth = max(0, self.blocked_depth - 1)
+            return
+        if not self.blocked_depth and tag in _MAIL_HTML_TAGS and tag not in _MAIL_HTML_VOID:
+            self.output.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if not self.blocked_depth:
+            self.output.append(html.escape(str(data or "")))
+
+
 def _safe_html(value):
-    s = str(value or "")
-    if not s.strip():
+    source = str(value or "")
+    if not source.strip():
         return ""
-    s = re.sub(r"(?is)<base\b[^>]*>", "", s)
-    s = re.sub(r"(?is)<script\b.*?>.*?</script>", "", s)
-    s = re.sub(r"(?is)<style\b.*?>.*?</style>", "", s)
-    s = re.sub(r"(?is)<iframe\b.*?>.*?</iframe>", "", s)
-    s = re.sub(r"(?is)<object\b.*?>.*?</object>", "", s)
-    s = re.sub(r"(?is)<embed\b.*?>.*?</embed>", "", s)
-    s = re.sub(r"(?is)<form\b.*?>.*?</form>", "", s)
-    s = re.sub(r"(?is)<link\b[^>]*>", "", s)
-    s = re.sub(r"(?is)<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh['\"]?[^>]*>", "", s)
-    s = re.sub(r"(?is)<img\b[^>]*>", "", s)
-    s = re.sub(r"\s+on[a-zA-Z]+\s*=\s*(['\"]).*?\1", "", s)
-    s = re.sub(r"\s+on[a-zA-Z]+\s*=\s*[^\s>]+", "", s)
-    s = re.sub(r"\s+(href|src|xlink:href)\s*=\s*(['\"])\s*(?:javascript|vbscript|data:|file:|ftp:)[^'\"]*\2", "", s, flags=re.I)
-    s = re.sub(r"\s+(href|src|xlink:href)\s*=\s*(?:javascript|vbscript|data:|file:|ftp:)[^\s>]*", "", s, flags=re.I)
-    s = re.sub(r"\s+target\s*=\s*(['\"]?)_parent\1", "", s, flags=re.I)
-    s = re.sub(r"\s+target\s*=\s*(['\"]?)_top\1", "", s, flags=re.I)
-    s = re.sub(r"\s+style\s*=\s*(['\"]).*?(?:expression\s*\(|javascript:|url\s*\().*?\1", "", s, flags=re.I | re.S)
-    s = re.sub(r"(?i)<a\b", '<a rel="noopener noreferrer"', s)
-    s = re.sub(r"(?i)<head([^>]*)>", '<head\\1><base target="_blank">', s, count=1)
-    if "<base" not in s.lower():
-        s = '<base target="_blank">' + s
-    return s
+    parser = _MailHTMLSanitizer()
+    parser.feed(source)
+    parser.close()
+    return '<base target="_blank">' + "".join(parser.output)
 
 
 def _html_and_links_from_raw(raw, fallback_text=""):
@@ -2504,18 +2557,13 @@ def list_backups():
 
 
 def backup_path_by_name(name):
-    name = os.path.basename(str(name or ""))
-    path = Path(BACKUP_DIR) / name
-    base = Path(BACKUP_DIR).resolve()
-    try:
-        resolved = path.resolve()
-    except OSError:
+    requested = str(name or "")
+    if not requested or requested != os.path.basename(requested) or not requested.endswith(".sqlite3"):
         raise ValueError("backup not found")
-    if base not in resolved.parents and resolved != base:
-        raise ValueError("backup path invalid")
-    if not resolved.exists() or resolved.suffix != ".sqlite3":
-        raise ValueError("backup not found")
-    return str(resolved)
+    for candidate in Path(BACKUP_DIR).glob("*.sqlite3"):
+        if hmac.compare_digest(candidate.name, requested) and candidate.is_file():
+            return str(candidate.resolve())
+    raise ValueError("backup not found")
 
 
 def restore_backup(name):
@@ -5067,11 +5115,18 @@ def host_allowed(value):
     return False
 
 
-def origin_allowed(value):
+def canonical_allowed_origin(value):
     origin = str(value or "").strip().rstrip("/")
     if not origin:
-        return False
-    return origin in CORS_ALLOWED_ORIGINS
+        return ""
+    for allowed in CORS_ALLOWED_ORIGINS:
+        if hmac.compare_digest(origin, allowed):
+            return allowed
+    return ""
+
+
+def origin_allowed(value):
+    return bool(canonical_allowed_origin(value))
 
 
 def security_headers(content_type=""):
@@ -5187,9 +5242,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             body = gzip.compress(body, compresslevel=5)
             response_headers["Content-Encoding"] = "gzip"
             response_headers["Vary"] = "Accept-Encoding"
-        origin = self.headers.get("Origin") or ""
-        if origin_allowed(origin):
-            response_headers["Access-Control-Allow-Origin"] = origin.rstrip("/")
+        origin = canonical_allowed_origin(self.headers.get("Origin") or "")
+        if origin:
+            response_headers["Access-Control-Allow-Origin"] = origin
             vary = {item.strip() for item in str(response_headers.get("Vary") or "").split(",") if item.strip()}
             vary.add("Origin")
             response_headers["Vary"] = ", ".join(sorted(vary))
@@ -5198,6 +5253,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(body)))
         for key, value in response_headers.items():
+            key = str(key)
+            value = str(value)
+            if any(char in key + value for char in ("\r", "\n", "\x00")):
+                continue
             self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
@@ -5392,16 +5451,17 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _do_OPTIONS(self):
         if not self.request_guard():
             return
-        origin = self.headers.get("Origin") or ""
-        if origin and not origin_allowed(origin):
+        requested_origin = self.headers.get("Origin") or ""
+        origin = canonical_allowed_origin(requested_origin)
+        if requested_origin and not origin:
             return self.send_json({"code": 403, "message": "origin not allowed"}, 403)
         self._response_started = True
         self.send_response(204)
         self.send_header("content-length", "0")
         self.send_header("access-control-allow-headers", "authorization,x-token,content-type")
         self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
-        if origin_allowed(origin):
-            self.send_header("access-control-allow-origin", origin.rstrip("/"))
+        if origin:
+            self.send_header("access-control-allow-origin", origin)
             self.send_header("vary", "Origin")
         for key, value in security_headers("application/json").items():
             self.send_header(key, value)
