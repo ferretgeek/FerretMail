@@ -17,5 +17,8 @@ Include the affected endpoint or component, impact, reproduction steps using syn
 - Put the web UI behind HTTPS; do not expose the administrator token over plain HTTP.
 - Restrict inbound ports to those required and keep the runtime patched.
 - Keep independent, encrypted backups and test recovery.
+- Configure `TRUSTED_PROXY_IPS` only for an exact proxy that overwrites `X-Forwarded-For`.
+- Share links keep bearer tokens in URL fragments and exchange them for short-lived HttpOnly sessions; legacy path-token links are rejected.
+- Webhook connections are pinned to validated public addresses, and SMTP DATA is governed by a process-wide byte budget.
 
 If a real token has been exposed, rotate it immediately. Removing it from the current file does not invalidate the leaked value.

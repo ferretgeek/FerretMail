@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- 修复五项安全问题：受信代理客户端隔离、Webhook DNS 固定、租户安全备份独立保留与全局冷却、SMTP 全局在途字节预算，以及 fragment 到 HttpOnly 会话的接码链接。
+- 旧 `/code/<token>` 链接现在返回 `410`；请重新导出为 `/code/#token=...`。
+- Fixed five security findings: trusted-proxy client isolation, DNS-pinned webhooks, isolated/cooldown-bound tenant safety backups, a process-wide SMTP DATA byte budget, and fragment-to-HttpOnly alias share sessions.
+- Legacy `/code/<token>` links now return `410`; re-export share links to use `/code/#token=...`.
+
 - 补齐标准贡献、变更和卸载入口；不改变运行行为。
 
 ## 1.0.0 — 2026-08-07

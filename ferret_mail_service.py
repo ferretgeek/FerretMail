@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import html
 import hmac
+import http.client
 import io
 import ipaddress
 import json
@@ -15,6 +16,8 @@ import shutil
 import socket
 import sqlite3
 import struct
+import ssl
+import tempfile
 import time
 import unicodedata
 import zlib
@@ -25,10 +28,10 @@ from email.utils import parseaddr
 from email.parser import BytesParser
 from email.header import decode_header, make_header
 from html.parser import HTMLParser
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import BoundedSemaphore, Condition, Lock, RLock, Thread
-from urllib import request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
 def _clean_domain_value(value):
@@ -87,12 +90,18 @@ SMTP_COMMAND_LIMIT = int(os.environ.get("SMTP_COMMAND_LIMIT", "250"))
 SMTP_MAX_CONNECTIONS = int(os.environ.get("SMTP_MAX_CONNECTIONS", "32"))
 SMTP_IDLE_TIMEOUT_SECONDS = int(os.environ.get("SMTP_IDLE_TIMEOUT_SECONDS", "120"))
 SMTP_DATA_TIMEOUT_SECONDS = int(os.environ.get("SMTP_DATA_TIMEOUT_SECONDS", "120"))
+SMTP_MAX_INFLIGHT_BYTES = int(os.environ.get("SMTP_MAX_INFLIGHT_BYTES", str(4 * MAX_MESSAGE_BYTES)))
 HTTP_MAX_CONNECTIONS = int(os.environ.get("HTTP_MAX_CONNECTIONS", "128"))
 HTTP_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("HTTP_REQUEST_TIMEOUT_SECONDS", "30"))
 MIN_DISK_FREE_BYTES = int(os.environ.get("MIN_DISK_FREE_BYTES", str(512 * 1024 * 1024)))
 BACKUP_MAX_AGE_HOURS = int(os.environ.get("BACKUP_MAX_AGE_HOURS", str(max(48, AUTO_BACKUP_HOURS * 2))))
 SQLITE_SYNCHRONOUS = os.environ.get("SQLITE_SYNCHRONOUS", "FULL").strip().upper()
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+TENANT_BACKUP_COOLDOWN_SECONDS = int(os.environ.get("TENANT_BACKUP_COOLDOWN_SECONDS", "900"))
+TENANT_BACKUP_MAX = int(os.environ.get("TENANT_BACKUP_MAX", "3"))
+TENANT_BACKUP_MAX_BYTES = int(
+    os.environ.get("TENANT_BACKUP_MAX_BYTES", str(max(64 * 1024 * 1024, MAX_BACKUP_BYTES // 4)))
+)
 if SQLITE_SYNCHRONOUS not in {"FULL", "EXTRA", "NORMAL"}:
     raise ValueError("SQLITE_SYNCHRONOUS must be FULL, EXTRA, or NORMAL")
 LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "180"))
@@ -116,6 +125,25 @@ TRUSTED_HOSTS = {
     ).split(",")
     if h.strip()
 }
+
+
+def _ip_literal_set(value, setting_name):
+    addresses = set()
+    for item in str(value or "").split(","):
+        raw = item.strip()
+        if not raw:
+            continue
+        try:
+            address = ipaddress.ip_address(raw.split("%", 1)[0])
+        except ValueError as exc:
+            raise ValueError(f"{setting_name} must contain IP literals") from exc
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError(f"{setting_name} contains an unsafe address")
+        addresses.add(str(address))
+    return frozenset(addresses)
+
+
+TRUSTED_PROXY_IPS = _ip_literal_set(os.environ.get("TRUSTED_PROXY_IPS", ""), "TRUSTED_PROXY_IPS")
 FAVICON_SVG = b'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
 <defs>
 <linearGradient id="bg" x1="20" y1="8" x2="108" y2="120" gradientUnits="userSpaceOnUse">
@@ -567,12 +595,20 @@ _HEALTH_CACHE = {"expires": 0.0, "data": None}
 _DNS_CACHE_LOCK = Lock()
 _DNS_CACHE = {}
 _BACKUP_LOCK = RLock()
+_TENANT_BACKUP_LOCK = Lock()
+_TENANT_BACKUP_LAST = 0.0
 _INTEGRITY_LOCK = Lock()
 _INTEGRITY_STATE = {"checked_at": 0, "ok": None, "message": "尚未检查"}
 _WEBHOOK_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ferret-webhook")
 _WEBHOOK_SLOTS = BoundedSemaphore(128)
 _HTTP_SLOTS = BoundedSemaphore(max(1, HTTP_MAX_CONNECTIONS))
 _SMTP_SLOTS = BoundedSemaphore(max(1, SMTP_MAX_CONNECTIONS))
+_SMTP_BYTES_LOCK = Lock()
+_SMTP_BYTES_INFLIGHT = 0
+_ALIAS_SESSION_LOCK = Lock()
+_ALIAS_SESSIONS = {}
+ALIAS_SESSION_SECONDS = 3600
+ALIAS_SESSION_MAX = 10000
 
 
 def now_ms():
@@ -600,6 +636,47 @@ def sha256_hex(value):
 
 def constant_time_equal(a, b):
     return hmac.compare_digest(str(a or "").encode("utf-8"), str(b or "").encode("utf-8"))
+
+
+def normalized_ip(value):
+    try:
+        return str(ipaddress.ip_address(str(value or "").split("%", 1)[0]))
+    except ValueError:
+        return "unknown"
+
+
+def forwarded_client_ip(peer, forwarded_for):
+    direct = normalized_ip(peer)
+    if direct not in TRUSTED_PROXY_IPS or not forwarded_for:
+        return direct
+    raw_hops = [item.strip() for item in str(forwarded_for).split(",")]
+    if not raw_hops or len(raw_hops) > 32:
+        return direct
+    hops = [normalized_ip(item) for item in raw_hops]
+    if "unknown" in hops:
+        return direct
+    current = direct
+    for candidate in reversed(hops):
+        if current not in TRUSTED_PROXY_IPS:
+            break
+        current = candidate
+    return current
+
+
+def reserve_smtp_bytes(amount):
+    global _SMTP_BYTES_INFLIGHT
+    amount = max(0, int(amount or 0))
+    with _SMTP_BYTES_LOCK:
+        if SMTP_MAX_INFLIGHT_BYTES > 0 and _SMTP_BYTES_INFLIGHT + amount > SMTP_MAX_INFLIGHT_BYTES:
+            return False
+        _SMTP_BYTES_INFLIGHT += amount
+        return True
+
+
+def release_smtp_bytes(amount):
+    global _SMTP_BYTES_INFLIGHT
+    with _SMTP_BYTES_LOCK:
+        _SMTP_BYTES_INFLIGHT = max(0, _SMTP_BYTES_INFLIGHT - max(0, int(amount or 0)))
 
 
 def rate_check(key, limit, window=60):
@@ -1278,41 +1355,102 @@ def save_domain(value, note="", default=DOMAIN):
     return domain
 
 
-def public_http_url_ok(value, resolve=True):
+def resolve_public_http_target(value, resolve=True):
     url = str(value or "").strip()
     if not url:
-        return True, ""
+        return None, (), ""
     try:
         parsed = urlparse(url)
     except Exception:
-        return False, "webhook URL invalid"
+        return None, (), "webhook URL invalid"
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        return False, "webhook URL must be http(s)"
+        return None, (), "webhook URL must be http(s)"
     if parsed.username or parsed.password:
-        return False, "webhook URL cannot contain credentials"
+        return None, (), "webhook URL cannot contain credentials"
     host = parsed.hostname.strip().lower()
     if host in {"localhost", "localhost.localdomain"}:
-        return False, "webhook URL cannot target localhost"
+        return None, (), "webhook URL cannot target localhost"
     if not resolve:
-        return True, ""
+        return parsed, (), ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except Exception:
-        return False, "webhook host cannot be resolved"
+        return None, (), "webhook host cannot be resolved"
     checked = set()
     for info in infos:
         ip = info[4][0]
-        if ip in checked:
-            continue
-        checked.add(ip)
         try:
             addr = ipaddress.ip_address(ip)
         except Exception:
-            return False, "webhook host resolved to an invalid address"
+            return None, (), "webhook host resolved to an invalid address"
         if not addr.is_global:
-            return False, "webhook URL cannot target private, local, reserved, or metadata networks"
-    return True, ""
+            return None, (), "webhook URL cannot target private, local, reserved, or metadata networks"
+        if str(addr) in checked:
+            continue
+        checked.add(str(addr))
+    return parsed, tuple(sorted(checked)), ""
+
+
+def public_http_url_ok(value, resolve=True):
+    if not str(value or "").strip():
+        return True, ""
+    parsed, _addresses, reason = resolve_public_http_target(value, resolve=resolve)
+    return bool(parsed), reason
+
+
+def open_pinned_webhook(parsed, approved_addresses, data):
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    last_error = None
+    for approved in approved_addresses:
+        connection = None
+        request_started = False
+        try:
+            if parsed.scheme == "https":
+                context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                connection = http.client.HTTPSConnection(host, port, timeout=5, context=context)
+            else:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+
+            def create_connection(_address, timeout=5, source_address=None):
+                return socket.create_connection((approved, port), timeout, source_address)
+
+            connection._create_connection = create_connection
+            connection.connect()
+            peer = normalized_ip(connection.sock.getpeername()[0] if connection.sock else "")
+            if peer not in approved_addresses:
+                raise OSError("webhook peer address changed")
+            request_started = True
+            connection.request(
+                "POST",
+                path,
+                body=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(data)),
+                    "Host": parsed.netloc,
+                    "Connection": "close",
+                    "User-Agent": "FerretMail/1.0",
+                },
+            )
+            response = connection.getresponse()
+            response.read(128)
+            if not 200 <= response.status < 300:
+                raise OSError(f"webhook returned HTTP {response.status}")
+            return
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            last_error = exc
+            if request_started:
+                break
+        finally:
+            if connection is not None:
+                connection.close()
+    raise OSError("webhook connection failed") from last_error
 
 
 def update_domain_settings(domain, values):
@@ -1735,18 +1873,12 @@ def notify_webhook(domain, payload):
         if not int(cfg.get("webhook_enabled") or 0):
             return
         url = (cfg.get("webhook_url") or "").strip()
-        ok, reason = public_http_url_ok(url)
-        if not ok:
+        parsed, approved_addresses, reason = resolve_public_http_target(url)
+        if not parsed or not approved_addresses:
             log_failed_mail(payload.get("fromEmail", ""), payload.get("toEmail", ""), "webhook blocked", reason)
             return
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
-        class _NoRedirect(urlrequest.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                return None
-        opener = urlrequest.build_opener(_NoRedirect)
-        with opener.open(req, timeout=5) as resp:
-            resp.read(128)
+        open_pinned_webhook(parsed, approved_addresses, data)
     except Exception as exc:
         log_failed_mail(payload.get("fromEmail", ""), payload.get("toEmail", ""), "webhook failed", str(exc))
 
@@ -2357,27 +2489,35 @@ def prune_backups():
             files.append((p.stat().st_mtime, p.stat().st_size, p))
         except OSError:
             pass
-    files.sort(key=lambda item: item[0], reverse=True)
-    total = sum(size for _, size, _ in files)
-    kept = list(files[:max(0, MAX_BACKUPS)])
-    deleted = 0
-    for item in files[max(0, MAX_BACKUPS):]:
-        _, size, path = item
-        try:
-            path.unlink(missing_ok=True)
-            total -= size
-            deleted += 1
-        except OSError:
-            kept.append(item)
-    while MAX_BACKUP_BYTES > 0 and total > MAX_BACKUP_BYTES and kept:
-        _, size, path = kept.pop()
-        try:
-            path.unlink(missing_ok=True)
-            total -= size
-            deleted += 1
-        except OSError:
-            pass
-    return deleted
+    tenant = [item for item in files if "inbox-tenant-safety-" in item[2].name]
+    protected = [item for item in files if item not in tenant]
+
+    def prune_group(items, max_count, max_bytes):
+        items.sort(key=lambda item: item[0], reverse=True)
+        total = sum(size for _, size, _ in items)
+        kept = list(items[:max(0, max_count)])
+        removed = 0
+        for item in items[max(0, max_count):]:
+            _, size, path = item
+            try:
+                path.unlink(missing_ok=True)
+                total -= size
+                removed += 1
+            except OSError:
+                kept.append(item)
+        while max_bytes > 0 and total > max_bytes and kept:
+            _, size, path = kept.pop()
+            try:
+                path.unlink(missing_ok=True)
+                total -= size
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    return prune_group(protected, MAX_BACKUPS, MAX_BACKUP_BYTES) + prune_group(
+        tenant, TENANT_BACKUP_MAX, TENANT_BACKUP_MAX_BYTES
+    )
 
 
 def cleanup_domain_if_due(domain, force=False, min_interval=60):
@@ -2403,6 +2543,12 @@ def stored_message_bytes(text, raw, attachments=None):
         if data is not None:
             total += len(data)
     return total
+
+
+def backup_total_limit():
+    if MAX_BACKUP_BYTES <= 0 or TENANT_BACKUP_MAX_BYTES <= 0:
+        return 0
+    return MAX_BACKUP_BYTES + TENANT_BACKUP_MAX_BYTES
 
 
 def backfill_message_metadata(batch_size=250, max_batches=None, domain=""):
@@ -2508,6 +2654,20 @@ def create_backup(kind="manual"):
         prune_backups()
         log_op(DOMAIN, "admin" if kind == "manual" else "system", "backup.create", {"name": os.path.basename(path), "size": size, "kind": kind})
         return {"path": path, "size": size, "kind": kind, "createdAt": now}
+
+
+def create_tenant_safety_backup():
+    global _TENANT_BACKUP_LAST
+    with _TENANT_BACKUP_LOCK:
+        now = time.monotonic()
+        retry_after = TENANT_BACKUP_COOLDOWN_SECONDS - (now - _TENANT_BACKUP_LAST)
+        if _TENANT_BACKUP_LAST and retry_after > 0:
+            raise ValueError(f"safety backup cooldown active; retry after {int(retry_after) + 1}s")
+        if TENANT_BACKUP_MAX_BYTES > 0 and db_file_size() > TENANT_BACKUP_MAX_BYTES:
+            raise ValueError("database exceeds the tenant safety backup budget")
+        result = create_backup("tenant-safety")
+        _TENANT_BACKUP_LAST = time.monotonic()
+        return result
 
 
 def db_maintenance():
@@ -2841,7 +3001,10 @@ def health_report(force=False):
     latest_backup_at = max((int(item.get("createdAt") or 0) for item in backup_files), default=0)
     latest_backup_age_hours = ((now_ms() - latest_backup_at) / 3600000) if latest_backup_at else None
     backup_recent = latest_backup_age_hours is not None and latest_backup_age_hours <= max(1, BACKUP_MAX_AGE_HOURS)
-    backup_ok = bool(backup_files) and backup_recent and (MAX_BACKUP_BYTES <= 0 or backup_size <= MAX_BACKUP_BYTES)
+    total_backup_limit = backup_total_limit()
+    backup_ok = bool(backup_files) and backup_recent and (
+        total_backup_limit <= 0 or backup_size <= total_backup_limit
+    )
     issues = []
     if not smtp_ok:
         issues.append(smtp_message)
@@ -2854,7 +3017,7 @@ def health_report(force=False):
             issues.append("尚无可用备份")
         elif not backup_recent:
             issues.append(f"最新备份已超过 {BACKUP_MAX_AGE_HOURS} 小时")
-        elif MAX_BACKUP_BYTES > 0 and backup_size > MAX_BACKUP_BYTES:
+        elif total_backup_limit > 0 and backup_size > total_backup_limit:
             issues.append("备份目录已超过容量上限")
     ok = smtp_ok and database_ok and disk_ok and backup_ok
     report = {
@@ -2870,7 +3033,7 @@ def health_report(force=False):
         "backupDiskFree": backup_disk_free,
         "dbSize": db_file_size(),
         "backupSize": backup_size,
-        "backupLimit": MAX_BACKUP_BYTES,
+        "backupLimit": total_backup_limit,
         "backupCount": len(backup_files),
         "latestBackupAt": latest_backup_at or None,
         "latestBackupAgeHours": round(latest_backup_age_hours, 2) if latest_backup_age_hours is not None else None,
@@ -3155,7 +3318,40 @@ def alias_share_path(token):
     token = normalize_alias_share_token(token)
     if not token:
         return ""
-    return "/code/" + token
+    return "/code/#token=" + token
+
+
+def create_alias_share_session(token):
+    token = normalize_alias_share_token(token)
+    if not token:
+        raise ValueError("invalid alias share token")
+    session_id = secrets.token_urlsafe(32)
+    expires = time.monotonic() + ALIAS_SESSION_SECONDS
+    with _ALIAS_SESSION_LOCK:
+        now = time.monotonic()
+        stale = [key for key, value in _ALIAS_SESSIONS.items() if value[1] <= now]
+        for key in stale[:2000]:
+            _ALIAS_SESSIONS.pop(key, None)
+        if len(_ALIAS_SESSIONS) >= ALIAS_SESSION_MAX:
+            oldest = sorted(_ALIAS_SESSIONS.items(), key=lambda item: item[1][1])
+            for key, _value in oldest[: max(1, len(oldest) - ALIAS_SESSION_MAX + 1)]:
+                _ALIAS_SESSIONS.pop(key, None)
+        _ALIAS_SESSIONS[session_id] = (token, expires)
+    return session_id
+
+
+def alias_share_session_token(session_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,80}", str(session_id or "")):
+        return ""
+    with _ALIAS_SESSION_LOCK:
+        value = _ALIAS_SESSIONS.get(str(session_id))
+        if not value:
+            return ""
+        token, expires = value
+        if expires <= time.monotonic():
+            _ALIAS_SESSIONS.pop(str(session_id), None)
+            return ""
+        return token
 
 
 def get_alias_by_share_token(token, touch=False):
@@ -3568,9 +3764,10 @@ Content-Type: application/json
 ### 公开接码取件
 
 ```http
-GET /public-api/alias-share?token=ALIAS_SHARE_TOKEN&page=1&pageSize=50&q=验证码
-GET /public-api/alias-share/message?token=ALIAS_SHARE_TOKEN&id=123
-GET /public-api/alias-share/changes?token=ALIAS_SHARE_TOKEN&since=0
+POST /public-api/alias-share/session  (token 仅在 JSON 正文中交换为 HttpOnly 会话)
+GET /public-api/alias-share?page=1&pageSize=50&q=验证码
+GET /public-api/alias-share/message?id=123
+GET /public-api/alias-share/changes?since=0
 ```
 
 公开接口只允许访问这个接码链接对应的单个别名。
@@ -3578,7 +3775,7 @@ GET /public-api/alias-share/changes?token=ALIAS_SHARE_TOKEN&since=0
 公开页面入口：
 
 ```http
-GET /code/ALIAS_SHARE_TOKEN
+GET /code/#token=ALIAS_SHARE_TOKEN
 ```
 
 ## 7. 主域名、子域名和 DNS 接口
@@ -3800,7 +3997,7 @@ GET /api-docs.md
 GET /usage-guide.md
 GET /mail
 GET /mail/example.org
-GET /code/ALIAS_SHARE_TOKEN
+GET /code/#token=ALIAS_SHARE_TOKEN
 ```
 
 `/mail/...` 是网页面板入口，不是 JSON API。
@@ -4938,7 +5135,7 @@ ALIAS_CODE_HTML = r'''<!doctype html>
 </div>
 <div class="toast" id="toast"></div>
 <script>
-const token=(location.pathname.split("/").pop()||"").trim();
+const token=(new URLSearchParams(location.hash.slice(1)).get("token")||"").trim();
 const $=(s,root=document)=>root.querySelector(s),$$=(s,root=document)=>Array.from(root.querySelectorAll(s));
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmt=ts=>ts?new Date(Number(ts)).toLocaleString():"";
@@ -4952,7 +5149,8 @@ function theme(v){document.documentElement.dataset.theme=v;localStorage.setItem(
 function palette(v){const next=aliasPalettes.has(v)?v:"sky";document.documentElement.dataset.palette=next;localStorage.setItem("alias_code_palette",next);const select=$("#paletteSelect");if(select)select.value=next}
 palette(localStorage.getItem("alias_code_palette")||"sky");
 theme(localStorage.getItem("alias_code_theme")||((matchMedia&&matchMedia("(prefers-color-scheme: dark)").matches)?"dark":"light"));
-async function req(path,params={}){params.token=token;const qs=new URLSearchParams(params),controller=new AbortController(),timer=setTimeout(()=>controller.abort(),path.includes("/changes")?35000:15000);try{const res=await fetch(path+"?"+qs.toString(),{headers:{accept:"application/json"},cache:"no-store",signal:controller.signal});const data=await res.json().catch(()=>({}));if(!res.ok||data.code>=400)throw new Error(data.message||"链接无效或已被禁用");return data}finally{clearTimeout(timer)}}
+async function req(path,params={}){const qs=new URLSearchParams(params),controller=new AbortController(),timer=setTimeout(()=>controller.abort(),path.includes("/changes")?35000:15000);try{const res=await fetch(path+(qs.size?"?"+qs.toString():""),{headers:{accept:"application/json"},cache:"no-store",credentials:"same-origin",signal:controller.signal});const data=await res.json().catch(()=>({}));if(!res.ok||data.code>=400)throw new Error(data.message||"链接无效或已被禁用");return data}finally{clearTimeout(timer)}}
+async function startSession(){if(!token)throw new Error("链接缺少 token");const res=await fetch("/public-api/alias-share/session",{method:"POST",headers:{"content-type":"application/json","accept":"application/json"},body:JSON.stringify({token}),cache:"no-store",credentials:"same-origin"});const data=await res.json().catch(()=>({}));if(!res.ok||data.code>=400)throw new Error(data.message||"链接无效或已被禁用");history.replaceState(null,"","/code/")}
 function renderList(){
 if(!mails.length){html("mailList",'<div class="empty">当前没有邮件。</div>');return}
 const more=total>mails.length?'<div class="empty"><button class="secondary" id="loadMoreBtn">加载更多</button></div>':'';
@@ -4973,7 +5171,7 @@ $("#refreshBtn").onclick=()=>load(true).then(()=>toast("已刷新"));
 $("#copyCodesBtn").onclick=copyCodes;
 $("#clearSearchBtn").onclick=()=>{$("#searchInput").value="";page=1;load(false)};
 let timer=0;$("#searchInput").oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>load(false),280)};
-if(!token)html("mailList",'<div class="empty err">链接缺少 token。</div>');else{load(false);liveLoop()}
+if(!token)html("mailList",'<div class="empty err">链接缺少 token。</div>');else{startSession().then(()=>{load(false);liveLoop()}).catch(e=>{setText("aliasMeta","链接不可用");html("mailList",`<div class="empty err">${esc(e.message)}</div>`)})}
 </script>
 </body>
 </html>'''
@@ -5190,7 +5388,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def client_ip(self):
         try:
-            return str(self.client_address[0] or "")
+            return forwarded_client_ip(
+                self.client_address[0],
+                self.headers.get("X-Forwarded-For"),
+            )
         except Exception:
             return "unknown"
 
@@ -5270,9 +5471,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
-    def send_json(self, data, status=200):
+    def send_json(self, data, status=200, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_bytes(body, "application/json; charset=utf-8", status)
+        self.send_bytes(body, "application/json; charset=utf-8", status, headers=headers)
 
     def read_body(self):
         n = int(getattr(self, "_content_length", self.headers.get("content-length") or 0))
@@ -5403,6 +5604,21 @@ class ApiHandler(BaseHTTPRequestHandler):
             return None
         return data
 
+    def alias_session_id(self):
+        try:
+            cookie = SimpleCookie()
+            cookie.load(self.headers.get("Cookie") or "")
+            morsel = cookie.get("ferret_alias_share")
+            return morsel.value if morsel else ""
+        except Exception:
+            return ""
+
+    def require_alias_share_session(self, touch=True):
+        return self.require_alias_share(
+            alias_share_session_token(self.alias_session_id()),
+            touch=touch,
+        )
+
     def _dispatch(self, callback):
         self._response_started = False
         try:
@@ -5506,11 +5722,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "text/markdown; charset=utf-8",
                 headers={"Content-Disposition": 'attachment; filename="ferret-mail-usage-guide.md"', "Cache-Control": "no-store"},
             )
-        elif path.startswith("/code/"):
+        elif path == "/code/":
             self.send_bytes(ALIAS_CODE_HTML)
+        elif path.startswith("/code/"):
+            self.send_json({"code": 410, "message": "legacy share URL retired; export a new link"}, 410)
         elif path == "/public-api/alias-share":
             query = parse_qs(parsed.query)
-            share = self.require_alias_share((query.get("token") or [""])[0], touch=True)
+            share = self.require_alias_share_session(touch=True)
             if not share:
                 return
             try:
@@ -5540,7 +5758,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json({"code": 400, "message": str(exc)}, 400)
         elif path == "/public-api/alias-share/message":
             query = parse_qs(parsed.query)
-            share = self.require_alias_share((query.get("token") or [""])[0], touch=True)
+            share = self.require_alias_share_session(touch=True)
             if not share:
                 return
             try:
@@ -5559,7 +5777,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not self.check_rate("alias-share-long-poll", LONG_POLL_RATE_LIMIT_PER_MIN):
                 return
             query = parse_qs(parsed.query)
-            share = self.require_alias_share((query.get("token") or [""])[0], touch=False)
+            share = self.require_alias_share_session(touch=False)
             if not share:
                 return
             client_ip = self.client_ip()
@@ -5935,7 +6153,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_json({"code": 200, "message": "success", "data": health_report(force=True)})
         elif path == "/ui-api/admin/backups":
             if not self.require_admin(): return
-            self.send_json({"code": 200, "message": "success", "data": list_backups(), "totalBytes": backup_total_size(), "limitBytes": MAX_BACKUP_BYTES})
+            self.send_json({"code": 200, "message": "success", "data": list_backups(), "totalBytes": backup_total_size(), "limitBytes": backup_total_limit()})
         elif path == "/ui-api/admin/backup-download":
             if not self.require_admin(): return
             try:
@@ -5982,6 +6200,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not self.request_guard(mutation=True):
             return
         path = urlparse(self.path).path
+        if path == "/public-api/alias-share/session":
+            body = self.read_body()
+            share = self.require_alias_share(body.get("token") or "", touch=True)
+            if not share:
+                return
+            session_id = create_alias_share_session(body.get("token") or "")
+            secure = PUBLIC_BASE_URL.lower().startswith("https://") or (
+                normalized_ip(self.client_address[0]) in TRUSTED_PROXY_IPS
+                and (self.headers.get("X-Forwarded-Proto") or "").lower() == "https"
+            )
+            cookie = (
+                f"ferret_alias_share={session_id}; Path=/public-api/alias-share; "
+                f"Max-Age={ALIAS_SESSION_SECONDS}; HttpOnly; SameSite=Strict"
+                + ("; Secure" if secure else "")
+            )
+            return self.send_json(
+                {"code": 200, "message": "success"},
+                headers={"Set-Cookie": cookie, "Cache-Control": "no-store"},
+            )
         if path in ("/public/addUser", "/api/public/addUser"):
             if not self.require_admin():
                 return
@@ -6281,7 +6518,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if str(body.get("confirm") or "").strip().lower() != email:
                     return self.send_json({"code": 400, "message": "email confirmation required"}, 400)
                 allowed_domain = scope_for_auth(self.auth)
-                create_backup("pre-clear")
+                create_tenant_safety_backup()
                 deleted = clear_alias_mails(email, allowed_domain)
             except PermissionError as exc:
                 return self.send_json({"code": 403, "message": str(exc)}, 403)
@@ -6298,7 +6535,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if str(body.get("confirm") or "").strip().lower() != domain:
                     return self.send_json({"code": 400, "message": "domain confirmation required"}, 400)
                 allowed_domain = scope_for_auth(self.auth)
-                create_backup("pre-clear")
+                create_tenant_safety_backup()
                 deleted = clear_domain_mails(domain, allowed_domain)
             except PermissionError as exc:
                 return self.send_json({"code": 403, "message": str(exc)}, 403)
@@ -6317,7 +6554,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if str(body.get("phrase") or "").strip() != "清空别名":
                     return self.send_json({"code": 400, "message": "phrase confirmation required"}, 400)
                 allowed_domain = scope_for_auth(self.auth)
-                create_backup("pre-clear")
+                create_tenant_safety_backup()
                 deleted = clear_domain_aliases(domain, allowed_domain)
             except PermissionError as exc:
                 return self.send_json({"code": 403, "message": str(exc)}, 403)
@@ -6454,45 +6691,54 @@ class SMTPConn:
                     await self.send("503 need MAIL and RCPT first")
                     continue
                 await self.send("354 end with <CRLF>.<CRLF>")
-                chunks = []
+                spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode="w+b")
                 total = 0
                 complete = False
-                while True:
-                    try:
-                        data = await asyncio.wait_for(self.reader.readline(), timeout=SMTP_DATA_TIMEOUT_SECONDS)
-                    except asyncio.TimeoutError:
-                        await self.send("421 data timeout")
-                        await self.close()
-                        return
-                    if not data:
-                        break
-                    if data in (b".\r\n", b".\n"):
-                        complete = True
-                        break
-                    if data.startswith(b".."):
-                        data = data[1:]
-                    total += len(data)
-                    if total > MAX_MESSAGE_BYTES:
-                        await self.send("552 message too large")
-                        await self.close()
-                        return
-                    chunks.append(data)
-                if not complete:
-                    await self.close()
-                    return
-                raw = b"".join(chunks)
-                recipients = list(self.rcpts)
-                response = "250 queued"
                 try:
-                    await asyncio.to_thread(store_mails, self.mail_from, recipients, raw)
-                except ValueError as exc:
-                    response = "552 message rejected"
-                    for rcpt in recipients:
-                        log_failed_mail(self.mail_from, rcpt, "message rejected", str(exc))
-                except Exception as exc:
-                    response = "451 temporary local problem"
-                    for rcpt in recipients:
-                        log_failed_mail(self.mail_from, rcpt, "temporary store failure", str(exc))
+                    while True:
+                        try:
+                            data = await asyncio.wait_for(self.reader.readline(), timeout=SMTP_DATA_TIMEOUT_SECONDS)
+                        except asyncio.TimeoutError:
+                            await self.send("421 data timeout")
+                            await self.close()
+                            return
+                        if not data:
+                            break
+                        if data in (b".\r\n", b".\n"):
+                            complete = True
+                            break
+                        if data.startswith(b".."):
+                            data = data[1:]
+                        if total + len(data) > MAX_MESSAGE_BYTES:
+                            await self.send("552 message too large")
+                            await self.close()
+                            return
+                        if not reserve_smtp_bytes(len(data)):
+                            await self.send("452 server message budget exhausted")
+                            await self.close()
+                            return
+                        total += len(data)
+                        spool.write(data)
+                    if not complete:
+                        await self.close()
+                        return
+                    spool.seek(0)
+                    raw = spool.read()
+                    recipients = list(self.rcpts)
+                    response = "250 queued"
+                    try:
+                        await asyncio.to_thread(store_mails, self.mail_from, recipients, raw)
+                    except ValueError as exc:
+                        response = "552 message rejected"
+                        for rcpt in recipients:
+                            log_failed_mail(self.mail_from, rcpt, "message rejected", str(exc))
+                    except Exception as exc:
+                        response = "451 temporary local problem"
+                        for rcpt in recipients:
+                            log_failed_mail(self.mail_from, rcpt, "temporary store failure", str(exc))
+                finally:
+                    spool.close()
+                    release_smtp_bytes(total)
                 self.reset_transaction()
                 await self.send(response)
             elif cmd == "RSET":
@@ -6611,6 +6857,12 @@ def validate_runtime_config():
             errors.append(f"{name} must be between {low} and {high}")
     if MAX_MESSAGE_BYTES <= 0:
         errors.append("MAX_MESSAGE_BYTES must be positive")
+    if SMTP_MAX_INFLIGHT_BYTES < MAX_MESSAGE_BYTES:
+        errors.append("SMTP_MAX_INFLIGHT_BYTES must be at least MAX_MESSAGE_BYTES")
+    if TENANT_BACKUP_COOLDOWN_SECONDS < 60:
+        errors.append("TENANT_BACKUP_COOLDOWN_SECONDS must be at least 60")
+    if TENANT_BACKUP_MAX < 1 or TENANT_BACKUP_MAX_BYTES < 1:
+        errors.append("tenant safety backup retention must be positive")
     if MAX_ATTACHMENT_BYTES < 0 or MAX_ATTACHMENT_BYTES > MAX_MESSAGE_BYTES:
         errors.append("MAX_ATTACHMENT_BYTES must be between 0 and MAX_MESSAGE_BYTES")
     if MIN_DISK_FREE_BYTES < 64 * 1024 * 1024:

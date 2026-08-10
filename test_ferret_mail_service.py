@@ -14,6 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from email.message import EmailMessage
+from unittest import mock
 
 
 TEST_ROOT = tempfile.TemporaryDirectory(prefix="ferret-mail-tests-")
@@ -44,6 +45,10 @@ SPEC.loader.exec_module(mail)
 
 
 def reset_state():
+    mail._TENANT_BACKUP_LAST = 0.0
+    mail._SMTP_BYTES_INFLIGHT = 0
+    with mail._ALIAS_SESSION_LOCK:
+        mail._ALIAS_SESSIONS.clear()
     with mail.db() as con:
         con.execute("DELETE FROM attachments")
         con.execute("DELETE FROM mails")
@@ -248,6 +253,78 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("\x1b", value)
         self.assertLessEqual(len(value.rstrip("\n")), 2000)
 
+    def test_proxy_identity_is_used_only_for_an_exact_trusted_peer(self):
+        original = mail.TRUSTED_PROXY_IPS
+        try:
+            mail.TRUSTED_PROXY_IPS = frozenset({"127.0.0.1", "192.0.2.10"})
+            self.assertEqual("198.51.100.7", mail.forwarded_client_ip("127.0.0.1", "198.51.100.7"))
+            self.assertEqual(
+                "198.51.100.7",
+                mail.forwarded_client_ip("127.0.0.1", "198.51.100.7, 192.0.2.10"),
+            )
+            self.assertEqual("198.51.100.8", mail.forwarded_client_ip("198.51.100.8", "198.51.100.7"))
+        finally:
+            mail.TRUSTED_PROXY_IPS = original
+
+    def test_tenant_backup_cooldown_and_smtp_byte_budget(self):
+        first = mail.create_tenant_safety_backup()
+        self.assertEqual("tenant-safety", first["kind"])
+        with self.assertRaisesRegex(ValueError, "cooldown"):
+            mail.create_tenant_safety_backup()
+        original_budget = mail.SMTP_MAX_INFLIGHT_BYTES
+        try:
+            mail.SMTP_MAX_INFLIGHT_BYTES = 10
+            self.assertTrue(mail.reserve_smtp_bytes(8))
+            self.assertFalse(mail.reserve_smtp_bytes(3))
+            mail.release_smtp_bytes(8)
+            self.assertEqual(0, mail._SMTP_BYTES_INFLIGHT)
+        finally:
+            mail.SMTP_MAX_INFLIGHT_BYTES = original_budget
+
+    def test_webhook_connection_is_pinned_before_post(self):
+        approved = "93.184.216.34"
+        with mock.patch.object(
+            mail.socket,
+            "getaddrinfo",
+            return_value=[(mail.socket.AF_INET, mail.socket.SOCK_STREAM, 6, "", (approved, 443))],
+        ):
+            parsed, addresses, reason = mail.resolve_public_http_target("https://example.com/hook")
+        self.assertEqual("", reason)
+        self.assertEqual((approved,), addresses)
+
+        class FakeSocket:
+            def getpeername(self):
+                return approved, 443
+
+        class FakeResponse:
+            status = 204
+
+            def read(self, _amount):
+                return b""
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs):
+                self.sock = FakeSocket()
+                self.request_data = None
+
+            def connect(self):
+                return None
+
+            def request(self, *args, **kwargs):
+                self.request_data = (args, kwargs)
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                return None
+
+        fake = FakeConnection()
+        with mock.patch.object(mail.http.client, "HTTPSConnection", return_value=fake):
+            mail.open_pinned_webhook(parsed, addresses, b"{}")
+        self.assertEqual("POST", fake.request_data[0][0])
+        self.assertEqual("/hook", fake.request_data[0][1])
+
 
 class HttpTests(unittest.TestCase):
     def setUp(self):
@@ -325,6 +402,28 @@ class HttpTests(unittest.TestCase):
             headers={"Authorization": token},
         )
         self.assertEqual(status, 403)
+
+    def test_alias_share_fragment_exchanges_for_http_only_session(self):
+        mail.save_aliases(["codes@example.com"], "test", "example.com")
+        share = mail.ensure_alias_share("codes@example.com", "example.com")
+        self.assertIn("/code/#token=", share["path"])
+        payload = json.dumps({"token": share["token"]}).encode("utf-8")
+        status, headers, _body = self.request(
+            "/public-api/alias-share/session",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            data=payload,
+        )
+        self.assertEqual(200, status)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        status, _headers, body = self.request(
+            "/public-api/alias-share?page=1",
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("codes@example.com", json.loads(body)["data"]["email"])
+        self.assertEqual(410, self.request("/code/legacy-token")[0])
 
 
 class SmtpTests(unittest.IsolatedAsyncioTestCase):
